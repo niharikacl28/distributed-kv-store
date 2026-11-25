@@ -22,3 +22,9 @@ target/
 # Temporary files
 *.tmp
 EOF
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/*.local
+frontend/npm-debug.log*

@@ -16,7 +16,9 @@ export function KvDeletePanel() {
   const [keyError, setKeyError] = useState<string | undefined>(undefined)
   const operation = useKvOperation<KeyValue>()
 
-  const errorResult = operation.error ? describeApiError(operation.error) : null
+  const errorResult = operation.error
+    ? describeApiError(operation.error, { notFound: 'Key not found' })
+    : null
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()

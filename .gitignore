@@ -1,0 +1,24 @@
+cat > .gitignore <<'EOF'
+# Maven build output
+target/
+
+# Java compiled files
+*.class
+
+# IDE files
+.idea/
+.vscode/
+*.iml
+.settings/
+.project
+.classpath
+
+# macOS files
+.DS_Store
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+EOF

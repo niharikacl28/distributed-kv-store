@@ -6,10 +6,12 @@ import {
   ListOrdered,
   Users,
 } from 'lucide-react'
+import { ActivityTimeline } from '../components/ActivityTimeline'
 import { NodeCard } from '../components/NodeCard'
 import { Panel } from '../components/Panel'
 import { StateMessage } from '../components/StateMessage'
 import { StatCard } from '../components/StatCard'
+import { useActivityEvents } from '../hooks/useActivityEvents'
 import type { ClusterStatusState } from '../hooks/useClusterStatus'
 import type { ClusterStatus, NodeStatus } from '../types/cluster'
 
@@ -48,6 +50,7 @@ function isStale(state: ClusterStatusState['state']): boolean {
 
 export function OverviewPage({ cluster }: { cluster: ClusterStatusState }) {
   const { data, state, error, lastUpdated, refresh } = cluster
+  const activity = useActivityEvents()
 
   return (
     <section className="mx-auto flex max-w-6xl flex-col gap-5">
@@ -163,6 +166,27 @@ export function OverviewPage({ cluster }: { cluster: ClusterStatusState }) {
           </Panel>
         </>
       )}
+
+      <Panel
+        title="Activity timeline"
+        description="Recent events recorded by the Raft cluster, newest first."
+        actions={
+          <button
+            type="button"
+            onClick={activity.refresh}
+            className="rounded-sm border border-surface-border px-2.5 py-1 text-[11px] font-medium text-content-muted transition-colors hover:border-accent/45 hover:text-accent"
+          >
+            Refresh
+          </button>
+        }
+      >
+        <ActivityTimeline
+          events={activity.events}
+          state={activity.state}
+          error={activity.error}
+          onRetry={activity.refresh}
+        />
+      </Panel>
     </section>
   )
 }

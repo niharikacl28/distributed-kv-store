@@ -1,6 +1,8 @@
 
 package com.distributedkv.cluster;
 
+import com.distributedkv.activity.EventHistory;
+import com.distributedkv.activity.EventType;
 import com.distributedkv.node.RaftNode;
 import com.distributedkv.node.RaftRole;
 import com.distributedkv.model.VoteRequest;
@@ -22,6 +24,14 @@ public class RaftCluster {
     private volatile int commitIndex = -1;
 
     private final Object electionLock = new Object();
+
+    // Bounded history of real cluster events, surfaced by the activity timeline.
+    private final EventHistory eventHistory = new EventHistory();
+
+    // Throttle interval so the 100 ms heartbeat loop cannot flood the history.
+    private static final long HEARTBEAT_EVENT_INTERVAL_MS = 5000L;
+
+    private volatile long lastHeartbeatEventAt = 0L;
 
     // Leader replication tracking
     private final Map<String, Integer> nextIndex = new HashMap<>();
@@ -93,6 +103,13 @@ public class RaftCluster {
 
                 initializeLeaderReplicationState(candidate);
 
+                eventHistory.record(
+                        EventType.LEADER_ELECTED,
+                        candidate.getNodeId() + " became leader for term "
+                                + candidate.getCurrentTerm(),
+                        candidate.getNodeId(),
+                        candidate.getCurrentTerm());
+
             } else {
 
                 System.out.println(
@@ -161,6 +178,8 @@ public class RaftCluster {
             return;
         }
 
+        int replicatedFollowers = 0;
+
         // Use AppendEntries with empty entries for heartbeats.
         for (RaftNode follower : nodes) {
 
@@ -168,8 +187,35 @@ public class RaftCluster {
                 continue;
             }
 
-            replicateToFollower(leader, follower);
+            if (replicateToFollower(leader, follower)) {
+                replicatedFollowers++;
+            }
         }
+
+        recordHeartbeatActivity(leader, replicatedFollowers);
+    }
+
+    /**
+     * Records a heartbeat activity event, throttled to at most one every
+     * {@link #HEARTBEAT_EVENT_INTERVAL_MS}. The heartbeat loop fires every
+     * 100 ms, so throttling prevents it from flooding the bounded history.
+     */
+    private void recordHeartbeatActivity(RaftNode leader, int followers) {
+
+        long now = System.currentTimeMillis();
+
+        if (now - lastHeartbeatEventAt < HEARTBEAT_EVENT_INTERVAL_MS) {
+            return;
+        }
+
+        lastHeartbeatEventAt = now;
+
+        eventHistory.record(
+                EventType.HEARTBEAT,
+                "Leader " + leader.getNodeId() + " sent heartbeats to "
+                        + followers + " follower(s)",
+                leader.getNodeId(),
+                leader.getCurrentTerm());
     }
 
     // ---------------- REPLICATE TO ONE FOLLOWER ----------------
@@ -281,9 +327,37 @@ public class RaftCluster {
         RaftNode leader = getLeader();
 
         if (leader == null) {
+
             System.out.println(
                     "Cannot write: No active leader!");
+
+            eventHistory.record(
+                    EventType.WRITE_FAILED,
+                    "Write rejected: no active leader for "
+                            + operation + " '" + key + "'",
+                    null,
+                    highestTerm());
+
             return false;
+        }
+
+        long term = leader.getCurrentTerm();
+
+        if ("PUT".equals(operation)) {
+
+            eventHistory.record(
+                    EventType.PUT_RECEIVED,
+                    "PUT request for key '" + key + "' received",
+                    leader.getNodeId(),
+                    term);
+
+        } else {
+
+            eventHistory.record(
+                    EventType.DELETE_RECEIVED,
+                    "DELETE request for key '" + key + "' received",
+                    leader.getNodeId(),
+                    term);
         }
 
         int index = leader.getLastLogIndex() + 1;
@@ -327,6 +401,18 @@ public class RaftCluster {
                 "Majority required: " + majority
         );
 
+        if (acknowledgements > 1) {
+
+            eventHistory.record(
+                    EventType.ENTRY_REPLICATED,
+                    "Log entry #" + index + " (" + operation + " '"
+                            + key + "') replicated to "
+                            + acknowledgements + "/" + nodes.size()
+                            + " nodes",
+                    leader.getNodeId(),
+                    term);
+        }
+
         // Attempt to advance the commit index. The write is only
         // considered successful when the entry is actually committed,
         // which is verified through the commit index rather than the
@@ -339,6 +425,13 @@ public class RaftCluster {
                     "\nLog entry committed at index " + commitIndex
             );
 
+            eventHistory.record(
+                    EventType.ENTRY_COMMITTED,
+                    "Log entry #" + index + " (" + operation + " '"
+                            + key + "') committed at index " + commitIndex,
+                    leader.getNodeId(),
+                    term);
+
             // Inform followers of the updated commit index.
             sendHeartbeats();
 
@@ -349,7 +442,26 @@ public class RaftCluster {
                 "Majority not reached. Entry remains uncommitted."
         );
 
+        eventHistory.record(
+                EventType.WRITE_FAILED,
+                "Write failed: majority not reached for entry #"
+                        + index + " (" + operation + " '" + key + "')",
+                leader.getNodeId(),
+                term);
+
         return false;
+    }
+
+    /** Highest current term observed across all nodes; used when no leader exists. */
+    private long highestTerm() {
+
+        long term = 0;
+
+        for (RaftNode node : nodes) {
+            term = Math.max(term, node.getCurrentTerm());
+        }
+
+        return term;
     }
 
     // ---------------- MAJORITY COMMITMENT ----------------
@@ -448,6 +560,12 @@ public class RaftCluster {
         }
 
         node.setAlive(false);
+
+        eventHistory.record(
+                EventType.NODE_CRASHED,
+                nodeId + " crashed",
+                nodeId,
+                node.getCurrentTerm());
     }
 
     // ---------------- NODE RECOVERY ----------------
@@ -475,6 +593,12 @@ public class RaftCluster {
             System.out.println(
                     "No active leader available for synchronization."
             );
+
+            eventHistory.record(
+                    EventType.NODE_RECOVERED,
+                    nodeId + " recovered (no active leader to synchronize from)",
+                    nodeId,
+                    node.getCurrentTerm());
 
             return;
         }
@@ -505,11 +629,24 @@ public class RaftCluster {
                     nodeId + " is now synchronized with the cluster."
             );
 
+            eventHistory.record(
+                    EventType.NODE_RECOVERED,
+                    nodeId + " recovered and synchronized from "
+                            + leader.getNodeId(),
+                    nodeId,
+                    node.getCurrentTerm());
+
         } else {
 
             System.out.println(
                     nodeId + " could not be synchronized."
             );
+
+            eventHistory.record(
+                    EventType.NODE_RECOVERED,
+                    nodeId + " recovered (synchronization failed)",
+                    nodeId,
+                    node.getCurrentTerm());
         }
     }
 
@@ -569,5 +706,10 @@ public class RaftCluster {
 
     public int getCommitIndex() {
         return commitIndex;
+    }
+
+    /** The bounded history of recent cluster events. */
+    public EventHistory getEventHistory() {
+        return eventHistory;
     }
 }

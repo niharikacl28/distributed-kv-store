@@ -7,10 +7,14 @@ import com.distributedkv.model.Heartbeat;
 import com.distributedkv.model.LogEntry;
 import com.distributedkv.model.AppendEntriesRequest;
 import com.distributedkv.model.AppendEntriesResponse;
+import com.distributedkv.persistence.LogEntryState;
+import com.distributedkv.persistence.NodeStateStore;
+import com.distributedkv.persistence.RaftPersistentState;
 import com.distributedkv.storage.KeyValueStore;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ThreadLocalRandom;
 
 public class RaftNode {
@@ -30,14 +34,28 @@ public class RaftNode {
     private final List<LogEntry> logEntries;
     private final KeyValueStore keyValueStore;
 
+    private int commitIndex = -1;
     private int lastApplied = -1;
 
     private long lastHeartbeatReceivedAt;
     private long electionTimeoutMillis;
 
+    // Optional durable state. When null the node is purely in-memory,
+    // preserving the behaviour of the original constructor.
+    private final NodeStateStore stateStore;
+
+    // Snapshot of what was last written to the store, used to avoid
+    // redundant writes while still persisting every real state change.
+    private RaftPersistentState lastWritten;
+
     public RaftNode(String nodeId) {
+        this(nodeId, null);
+    }
+
+    public RaftNode(String nodeId, NodeStateStore stateStore) {
 
         this.nodeId = nodeId;
+        this.stateStore = stateStore;
 
         this.role = RaftRole.FOLLOWER;
         this.currentTerm = 0;
@@ -52,7 +70,116 @@ public class RaftNode {
         this.logEntries = new ArrayList<>();
         this.keyValueStore = new KeyValueStore();
 
+        this.commitIndex = -1;
+        this.lastApplied = -1;
+
+        restorePersistentState();
+
         resetElectionTimeout();
+    }
+
+    // ---------------- PERSISTENCE ----------------
+
+    /**
+     * Restores term, vote and log from durable storage, if any. A node is
+     * always restored as a FOLLOWER: leadership is never recovered and must
+     * be re-earned through a fresh election.
+     */
+    private synchronized void restorePersistentState() {
+
+        if (stateStore == null) {
+            return;
+        }
+
+        Optional<RaftPersistentState> loaded = stateStore.load();
+
+        if (loaded.isEmpty()) {
+            return;
+        }
+
+        RaftPersistentState state = loaded.get();
+
+        this.currentTerm = Math.max(0, state.currentTerm());
+        this.votedFor = state.votedFor();
+        this.commitIndex = Math.max(-1, state.commitIndex());
+
+        logEntries.clear();
+
+        if (state.log() != null) {
+            for (LogEntryState entry : state.log()) {
+                logEntries.add(new LogEntry(
+                        entry.index(),
+                        entry.term(),
+                        entry.operation(),
+                        entry.key(),
+                        entry.value()
+                ));
+            }
+        }
+
+        updateLastLogInformation();
+
+        // The key-value store is a pure fold of committed log entries and is
+        // rebuilt by replaying the log (see RaftCluster), so application
+        // always restarts from the beginning of the log.
+        this.lastApplied = -1;
+
+        // Never restore the previous role: a restarted node is a FOLLOWER.
+        this.role = RaftRole.FOLLOWER;
+        this.knownLeader = null;
+
+        this.lastWritten = buildState();
+
+        System.out.println(
+                nodeId + " restored persistent state: term=" + currentTerm
+                        + ", votedFor=" + votedFor
+                        + ", commitIndex=" + commitIndex
+                        + ", logEntries=" + logEntries.size()
+        );
+    }
+
+    private RaftPersistentState buildState() {
+
+        List<LogEntryState> log = new ArrayList<>(logEntries.size());
+
+        for (LogEntry entry : logEntries) {
+            log.add(new LogEntryState(
+                    entry.getIndex(),
+                    entry.getTerm(),
+                    entry.getOperation(),
+                    entry.getKey(),
+                    entry.getValue()
+            ));
+        }
+
+        return new RaftPersistentState(
+                currentTerm,
+                votedFor,
+                commitIndex,
+                lastApplied,
+                log
+        );
+    }
+
+    /**
+     * Persists the node's durable state when it differs from the last
+     * written snapshot. Called before responding to Raft requests so that
+     * term, vote and log changes are durable.
+     */
+    private synchronized void persistIfChanged() {
+
+        if (stateStore == null) {
+            return;
+        }
+
+        RaftPersistentState current = buildState();
+
+        if (current.equals(lastWritten)) {
+            return;
+        }
+
+        stateStore.save(current);
+        lastWritten = current;
     }
 
     // ---------------- ELECTION TIMEOUT ----------------
@@ -92,6 +219,9 @@ public class RaftNode {
         knownLeader = null;
 
         resetElectionTimeout();
+
+        // Persist the new term and self-vote before soliciting votes.
+        persistIfChanged();
 
         System.out.println(
                 nodeId + " started election for term " + currentTerm
@@ -142,6 +272,9 @@ public class RaftNode {
 
             resetElectionTimeout();
 
+            // Persist the granted vote before responding.
+            persistIfChanged();
+
             System.out.println(
                     nodeId + " granted vote to "
                     + request.getCandidateId()
@@ -149,6 +282,9 @@ public class RaftNode {
 
             return new VoteResponse(currentTerm, true);
         }
+
+        // Persist any term change observed above even when the vote is denied.
+        persistIfChanged();
 
         return new VoteResponse(currentTerm, false);
     }
@@ -175,6 +311,8 @@ public class RaftNode {
             knownLeader = null;
 
             resetElectionTimeout();
+
+            persistIfChanged();
         }
     }
 
@@ -199,6 +337,9 @@ public class RaftNode {
         knownLeader = heartbeat.getLeaderId();
 
         resetElectionTimeout();
+
+        // Persist any term/vote change triggered by the heartbeat.
+        persistIfChanged();
 
         return true;
     }
@@ -231,6 +372,9 @@ public class RaftNode {
         knownLeader = request.getLeaderId();
 
         resetElectionTimeout();
+
+        // Persist any term/vote change before validating the entries.
+        persistIfChanged();
 
         // Validate previous log index
         int previousIndex = request.getPreviousLogIndex();
@@ -338,6 +482,9 @@ public class RaftNode {
 
         applyCommittedEntries(newCommitIndex);
 
+        // Persist the appended/repaired log and commit index before acking.
+        persistIfChanged();
+
         return new AppendEntriesResponse(
                 currentTerm,
                 true,
@@ -372,6 +519,9 @@ public class RaftNode {
 
         updateLastLogInformation();
 
+        // The new (still uncommitted) entry is made durable immediately.
+        persistIfChanged();
+
         System.out.println(
                 nodeId + " appended log entry: " + entry
         );
@@ -396,6 +546,8 @@ public class RaftNode {
         knownLeader = leaderId;
 
         resetElectionTimeout();
+
+        persistIfChanged();
 
         int matchingIndex = 0;
 
@@ -445,6 +597,8 @@ public class RaftNode {
                 Math.min(leaderCommitIndex, lastLogIndex)
         );
 
+        persistIfChanged();
+
         System.out.println(
                 nodeId + " successfully synchronized with " + leaderId
         );
@@ -454,9 +608,17 @@ public class RaftNode {
 
     // ---------------- APPLY COMMITTED ENTRIES ----------------
 
-    public synchronized void applyCommittedEntries(int commitIndex) {
+    public synchronized void applyCommittedEntries(int targetCommitIndex) {
 
-        while (lastApplied < commitIndex
+        // Track the highest commit index this node has observed, clamped to
+        // the entries it actually holds. Never advance beyond the log.
+        int effectiveCommit = Math.min(targetCommitIndex, lastLogIndex);
+
+        if (effectiveCommit > commitIndex) {
+            commitIndex = effectiveCommit;
+        }
+
+        while (lastApplied < targetCommitIndex
                 && lastApplied + 1 < logEntries.size()) {
 
             LogEntry entry = logEntries.get(lastApplied + 1);
@@ -479,6 +641,9 @@ public class RaftNode {
                     nodeId + " applied log entry " + lastApplied
             );
         }
+
+        // Persist the advanced commit index / applied position.
+        persistIfChanged();
     }
 
     // ---------------- STORAGE ----------------
@@ -550,6 +715,11 @@ public class RaftNode {
 
     public synchronized int getLastLogIndex() {
         return lastLogIndex;
+    }
+
+    /** The highest commit index this node has observed and persisted. */
+    public synchronized int getCommitIndex() {
+        return commitIndex;
     }
 
     public synchronized long getLastLogTerm() {

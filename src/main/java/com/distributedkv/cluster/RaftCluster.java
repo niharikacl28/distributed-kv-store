@@ -11,7 +11,10 @@ import com.distributedkv.model.Heartbeat;
 import com.distributedkv.model.LogEntry;
 import com.distributedkv.model.AppendEntriesRequest;
 import com.distributedkv.model.AppendEntriesResponse;
+import com.distributedkv.persistence.FileNodeStateStore;
+import com.distributedkv.persistence.NodeStateStore;
 
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -38,12 +41,72 @@ public class RaftCluster {
     private final Map<String, Integer> matchIndex = new HashMap<>();
 
     public RaftCluster(int numberOfNodes) {
+        this(numberOfNodes, null);
+    }
+
+    /**
+     * Creates a cluster whose nodes persist their Raft state as JSON files
+     * under {@code stateDirectory}. When {@code stateDirectory} is
+     * {@code null} the cluster is purely in-memory.
+     *
+     * <p>Any previously persisted state is restored while the nodes are
+     * constructed, and each node's key-value store is rebuilt by replaying
+     * committed entries only.</p>
+     */
+    public RaftCluster(int numberOfNodes, Path stateDirectory) {
 
         nodes = new ArrayList<>();
 
         for (int i = 1; i <= numberOfNodes; i++) {
-            nodes.add(new RaftNode("Node-" + i));
+
+            String nodeId = "Node-" + i;
+
+            NodeStateStore stateStore = stateDirectory == null
+                    ? null
+                    : new FileNodeStateStore(stateDirectory, nodeId);
+
+            nodes.add(new RaftNode(nodeId, stateStore));
         }
+
+        restoreCommitIndex();
+    }
+
+    /**
+     * Restores the cluster commit index from the persisted node state and
+     * rebuilds each node's key-value store by replaying committed entries.
+     * The commit index is clamped so it can never exceed the available log,
+     * and uncommitted entries are never applied.
+     */
+    private void restoreCommitIndex() {
+
+        int restored = -1;
+
+        for (RaftNode node : nodes) {
+            // A node can only vouch for entries it actually holds.
+            int nodeCommit = Math.min(
+                    node.getCommitIndex(),
+                    node.getLastLogIndex()
+            );
+            restored = Math.max(restored, nodeCommit);
+        }
+
+        commitIndex = Math.max(-1, restored);
+
+        if (commitIndex < 0) {
+            return;
+        }
+
+        for (RaftNode node : nodes) {
+            int safeCommit = Math.min(commitIndex, node.getLastLogIndex());
+            if (safeCommit >= 0) {
+                node.applyCommittedEntries(safeCommit);
+            }
+        }
+
+        System.out.println(
+                "Restored cluster commit index " + commitIndex
+                        + " and replayed committed entries."
+        );
     }
 
     // ---------------- LEADER ELECTION ----------------

@@ -28,3 +28,6 @@ frontend/dist/
 frontend/dist-ssr/
 frontend/*.local
 frontend/npm-debug.log*
+
+# Runtime Raft persistence state
+data/
